@@ -6,13 +6,15 @@ package infodump
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"sync"
-	"regexp"
+	"time"
 )
 
 var validPathRe = regexp.MustCompile(`^[a-z0-9_:-]+(/[a-z0-9_:-]+)*$`)
@@ -21,22 +23,148 @@ func IsValidPath(path string) bool {
 	return validPathRe.MatchString(path)
 }
 
-type Object struct {
-	Type      string            // mime type
-	Path      string            // human-friendly name
-	BlobRef   string            // hash of our content
-	ParentRef string            // hash of our previous version
-	CTime     int64             // creation time UnixNanos
-	MTime     int64             // modification time UnixNanos
-	Tags      []string          // associated tags
-	Attr      map[string]string // content metadata nv pairs
+// Newly created objects are mutable.  Objects obtained
+// from the Object store are not (setters have no effect).
 
-	RefCount int32  // number of parents
-	SelfRef  string // hash of our serialized form
-	Parent   *Object
+type Object interface {
+	Type() string    // mime type
+	BlobRef() string // reference to current content
+	CTime() int64    // creation time in UnixNanos
+	MTime() int64    // modification time in UnixNanos
+	Tags() []string  // associated tags
+	RefCount() int32 // number of parents
+	SelfRef() string // reference to ourself in blobstore
+	UniqRef() string // reference to a uniq object
+	Parent() Object
+
+	SetType(mt string)
+	SetBlob(ref string)
+	SetCTime(t int64)
+	SetMTime(t int64)
+	SetTags(tags []string)
+	SetAttr(name string, value string)
+	SetUniq(ref string)
+
+	Serialize() []byte
+
+	Private() *object
 }
 
-type ObjectJson struct {
+func (o *object) Type() string    { return o.mimetype }
+func (o *object) BlobRef() string { return o.blobRef }
+func (o *object) CTime() int64    { return o.cTime }
+func (o *object) MTime() int64    { return o.mTime }
+func (o *object) Tags() []string  { return o.tags }
+func (o *object) RefCount() int32 { return o.refCount }
+func (o *object) SelfRef() string { return o.selfRef }
+func (o *object) UniqRef() string { return o.uniqRef }
+func (o *object) Parent() Object  { return o.parent }
+
+func (o *object) SetType(mt string) {
+	if o.mutable {
+		o.mimetype = mt
+	}
+}
+
+func (o *object) SetBlob(ref string) {
+	if o.mutable {
+		o.blobRef = ref
+	}
+}
+
+func (o *object) SetTags(tags []string) {
+	// TODO: copy?
+	if o.mutable {
+		o.tags = tags
+	}
+}
+
+func (o *object) SetAttr(name string, value string) {
+	if !o.mutable {
+		return
+	}
+	if o.attrs == nil {
+		o.attrs = map[string]string{
+			name: value,
+		}
+	} else {
+		o.attrs[name] = value
+	}
+}
+
+func (o *object) SetUniq(ref string) {
+	if o.mutable {
+		o.uniqRef = ref
+	}
+}
+
+func (o *object) SetCTime(t int64) {
+	if o.mutable {
+		o.cTime = t
+	}
+}
+
+func (o *object) SetMTime(t int64) {
+	if o.mutable {
+		o.mTime = t
+	}
+}
+
+func (o *object) Serialize() []byte {
+	return o.pack()
+}
+
+func (o *object) Private() *object { return o }
+
+func NewObjectFromJSON(bytes []byte) (Object, error) {
+	return unpackObject(bytes)
+}
+
+func NewObject(parent Object) Object {
+	now := time.Now().UnixNano()
+
+	if parent == nil {
+		o := &object{
+			cTime:   now,
+			mTime:   now,
+			mutable: true,
+		}
+		return o
+	}
+
+	p := parent.Private()
+	o := &object{
+		mimetype: p.mimetype,
+		blobRef:  p.blobRef,
+		cTime:    p.cTime,
+		mTime:    now,
+		tags:     p.tags,  // TODO: copy
+		attrs:    p.attrs, // TODO: copy
+		parent:   p,
+		mutable:  true,
+	}
+	return o
+}
+
+type object struct {
+	mimetype  string
+	selfRef   string
+	blobRef   string
+	uniqRef   string
+	parentRef string
+	cTime     int64
+	mTime     int64
+	tags      []string
+	attrs     map[string]string
+	entries   map[string]string
+
+	refCount int32
+	parent   *object
+	mutable  bool // may this object be modified?
+}
+
+// for JSON deserializing
+type anyobject struct {
 	Type      string
 	Path      string
 	BlobRef   string
@@ -44,7 +172,7 @@ type ObjectJson struct {
 	CTime     string
 	MTime     string
 	Tags      []string
-	Attr      map[string]string
+	Attrs     map[string]string
 	InfoHash  string
 }
 
@@ -56,8 +184,8 @@ var infohash = []byte(",\"infohash\":\"")
 var infodumpNoComma = infodump[:len(infodump)-1]
 var infohashNoComma = infohash[2:]
 
-func NewObject(b []byte) (o *Object, err error) {
-	var t ObjectJson
+func unpackObject(b []byte) (o *object, err error) {
+	var t anyobject
 
 	// require magic/version
 	if !bytes.HasPrefix(b, infodump) {
@@ -96,36 +224,43 @@ func NewObject(b []byte) (o *Object, err error) {
 	ctime, _ := strconv.ParseInt(t.CTime, 10, 64)
 	mtime, _ := strconv.ParseInt(t.MTime, 10, 64)
 
-	o = &Object{
-		Type:      t.Type,
-		Path:      t.Path,
-		BlobRef:   t.BlobRef,
-		ParentRef: t.ParentRef,
-		CTime:     ctime,
-		MTime:     mtime,
-		Tags:      t.Tags,
-		Attr:      t.Attr,
-		SelfRef:   string(sum),
+	o = &object{
+		mimetype:  t.Type,
+		blobRef:   t.BlobRef,
+		parentRef: t.ParentRef,
+		cTime:     ctime,
+		mTime:     mtime,
+		tags:      t.Tags,
+		attrs:     t.Attrs,
+		selfRef:   hex.EncodeToString(sum),
+		mutable:   false,
 	}
 	return
 }
 
-func (o *Object) Serialize() []byte {
+func (o *object) pack() []byte {
 	// string maps get marshalled into json in key sort order
 	payload := make(map[string]interface{})
-	payload["type"] = o.Type
-	payload["path"] = o.Path
-	payload["blobref"] = o.BlobRef
-	payload["parentref"] = o.ParentRef
-	payload["ctime"] = strconv.FormatInt(o.CTime, 10)
-	payload["mtime"] = strconv.FormatInt(o.MTime, 10)
-	if o.Tags != nil {
-		payload["tags"] = o.Tags
+	payload["type"] = o.mimetype
+
+	// uniq objects are special and never have non-attr fields
+	if o.mimetype != "infodump/uniq" {
+		payload["blobref"] = o.blobRef
+		payload["parentref"] = o.parentRef
+		payload["ctime"] = strconv.FormatInt(o.cTime, 10)
+		payload["mtime"] = strconv.FormatInt(o.mTime, 10)
+		if o.tags != nil {
+			payload["tags"] = o.tags
+		}
 	}
-	if o.Attr != nil {
-		payload["attr"] = o.Attr
+	if o.attrs != nil {
+		payload["attrs"] = o.attrs
 	}
 
+	return serialize(payload)
+}
+
+func serialize(payload interface{}) []byte {
 	buf := new(bytes.Buffer)
 
 	// prepend magic/version kv
@@ -158,20 +293,9 @@ func (o *Object) Serialize() []byte {
 	return buf.Bytes()
 }
 
-func (o *Object) SetAttr(name string, value string) {
-	if o.Attr == nil {
-		o.Attr = map[string]string{
-			name: value,
-		}
-	} else {
-		o.Attr[name] = value
-	}
-}
-
 type ObjectStore struct {
-	bs      *BlobStore
-	refMap  map[string]*Object
-	pathMap map[string]*Object
+	bs      BlobStore
+	refMap  map[string]*object
 	lock    sync.Mutex
 	verbose bool
 }
@@ -180,7 +304,7 @@ func (os *ObjectStore) PreloadBlob(hexname string, data []byte) error {
 	if os.verbose {
 		fmt.Printf("objstore: preload: %s... %d\n", hexname[:8], len(data))
 	}
-	o, err := NewObject(data)
+	o, err := unpackObject(data)
 	if err != nil {
 		if os.verbose {
 			fmt.Printf("objstore: preload: %s... %v\n", hexname[:8], err)
@@ -191,89 +315,75 @@ func (os *ObjectStore) PreloadBlob(hexname string, data []byte) error {
 	return nil
 }
 
-func NewObjectStore(path string) *ObjectStore {
-	os := &ObjectStore{
-		refMap:  make(map[string]*Object),
-		pathMap: make(map[string]*Object),
+func NewObjectStore(bs BlobStore) *ObjectStore {
+	return &ObjectStore{
+		bs:      bs,
+		refMap:  make(map[string]*object),
 		verbose: true,
 	}
-
-	os.bs = NewBlobStore(path, os)
-	return os
 }
 
-func (os *ObjectStore) GetByRef(ref string) *Object {
+func (os *ObjectStore) Get(ref string) Object {
 	os.lock.Lock()
 	o := os.refMap[ref]
 	os.lock.Unlock()
 	return o
 }
 
-func (os *ObjectStore) GetByPath(path string) *Object {
-	os.lock.Lock()
-	o := os.pathMap[path]
-	os.lock.Unlock()
-	return o
-}
-
-func (os *ObjectStore) Put(obj *Object) error {
-	// TODO: validate name, etc
-
+func (os *ObjectStore) Put(obj Object) error {
 	if obj == nil {
 		return ErrBadObject
 	}
-
-	data := obj.Serialize()
-	hash := sha256.New()
-	hash.Write(data)
-	obj.SelfRef = string(hash.Sum(nil))
-
-	os.lock.Lock()
-	defer os.lock.Unlock()
-
-	if os.pathMap[obj.Path] != nil {
-		return ErrExists
-	}
-
-	os.pathMap[obj.Path] = obj
-	os.refMap[obj.SelfRef] = obj
-
-	// commit to disk (after lock?)
-	return nil
+	return os.put(obj.Private())
 }
 
-func (os *ObjectStore) Replace(obj *Object, old *Object) error {
-	// TODO: validate name, etc
+func (os *ObjectStore) newUniq(root bool) (o Object, err error) {
+	rval := make([]byte, 32)
+	if _, err = rand.Read(rval); err != nil {
+		return
+	}
 
-	if (obj == nil) || (old == nil) {
+	o = NewObject(nil)
+	o.SetType("infodump/uniq")
+	o.SetAttr("random", hex.EncodeToString(rval))
+	if root {
+		o.SetAttr("root", "true")
+	}
+	if err = os.Put(o); err != nil {
+		o = nil
+	}
+	return
+}
+
+func (os *ObjectStore) NewUniq() (o Object, err error) {
+	return os.newUniq(false)
+}
+
+func (os *ObjectStore) NewUniqRoot() (o Object, err error) {
+	return os.newUniq(true)
+}
+
+func (os *ObjectStore) put(obj *object) error {
+	if !obj.mutable {
 		return ErrBadObject
 	}
+	// TODO: copy to prevent mutation via race condition?
+	obj.mutable = false
 
-	obj.ParentRef = old.SelfRef
-	obj.Parent = old
+	data := obj.pack()
 
-	data := obj.Serialize()
-	hash := sha256.New()
-	hash.Write(data)
-	obj.SelfRef = string(hash.Sum(nil))
+	// write to the blobstore and obtain a blobref
+	ref, err := os.bs.Put(data)
+	if err != nil {
+		return err
+	}
+	obj.selfRef = ref
 
+	// TODO: anything to do should this collide?
+	// (the chances of a non-identical object colliding seems... very unlikely)
 	os.lock.Lock()
-	defer os.lock.Unlock()
+	os.refMap[ref] = obj
+	os.lock.Unlock()
 
-	checkOldRef := os.refMap[old.SelfRef]
-	checkOldPath := os.pathMap[obj.Path]
-
-	if checkOldRef == nil {
-		return ErrNotFound
-	}
-	if checkOldPath != old {
-		return ErrExists
-	}
-
-	os.refMap[obj.SelfRef] = obj
-	os.pathMap[obj.Path] = obj
-	old.RefCount++
-
-	// commit to disk (after lock?)
 	return nil
 }
