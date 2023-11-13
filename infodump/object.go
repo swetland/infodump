@@ -11,23 +11,31 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 var validPathRe = regexp.MustCompile(`^[a-z0-9_:-]+(/[a-z0-9_:-]+)*$`)
+var validNameRe = regexp.MustCompile(`^[a-z0-9_:-]+$`)
 
 func IsValidPath(path string) bool {
 	return validPathRe.MatchString(path)
+}
+
+func IsValidName(name string) bool {
+	return validNameRe.MatchString(name)
 }
 
 // Newly created objects are mutable.  Objects obtained
 // from the Object store are not (setters have no effect).
 
 type Object interface {
-	Type() string    // mime type
+	Type() string    // object type
 	BlobRef() string // reference to current content
 	CTime() int64    // creation time in UnixNanos
 	MTime() int64    // modification time in UnixNanos
@@ -37,32 +45,57 @@ type Object interface {
 	UniqRef() string // reference to a uniq object
 	Parent() Object
 
+	GetAttr(string) string
+	GetEntry(string) string
+	GetEntries() []string
+
 	SetType(mt string)
 	SetBlob(ref string)
 	SetCTime(t int64)
 	SetMTime(t int64)
 	SetTags(tags []string)
 	SetAttr(name string, value string)
+	SetEntry(name string, value string)
 	SetUniq(ref string)
 
 	Serialize() []byte
 
 	Private() *object
+
+	String() string
 }
 
-func (o *object) Type() string    { return o.mimetype }
+func (o *object) Type() string    { return o.objType }
 func (o *object) BlobRef() string { return o.blobRef }
 func (o *object) CTime() int64    { return o.cTime }
 func (o *object) MTime() int64    { return o.mTime }
-func (o *object) Tags() []string  { return o.tags }
+func (o *object) Tags() []string  { return slices.Clone(o.tags) }
 func (o *object) RefCount() int32 { return o.refCount }
 func (o *object) SelfRef() string { return o.selfRef }
 func (o *object) UniqRef() string { return o.uniqRef }
 func (o *object) Parent() Object  { return o.parent }
 
-func (o *object) SetType(mt string) {
+func (o *object) GetAttr(name string) string {
+	return o.attrs[name]
+}
+
+func (o *object) GetEntry(name string) string {
+	return o.entries[name]
+}
+
+func (o *object) GetEntries() []string {
+	x := make([]string, len(o.entries))
+	n := 0
+	for k, _ := range o.entries {
+		x[n] = k
+		n++
+	}
+	return x
+}
+
+func (o *object) SetType(ot string) {
 	if o.mutable {
-		o.mimetype = mt
+		o.objType = ot
 	}
 }
 
@@ -73,9 +106,8 @@ func (o *object) SetBlob(ref string) {
 }
 
 func (o *object) SetTags(tags []string) {
-	// TODO: copy?
 	if o.mutable {
-		o.tags = tags
+		o.tags = slices.Clone(tags)
 	}
 }
 
@@ -89,6 +121,19 @@ func (o *object) SetAttr(name string, value string) {
 		}
 	} else {
 		o.attrs[name] = value
+	}
+}
+
+func (o *object) SetEntry(name string, value string) {
+	if !o.mutable {
+		return
+	}
+	if o.entries == nil {
+		o.entries = map[string]string{
+			name: value,
+		}
+	} else {
+		o.entries[name] = value
 	}
 }
 
@@ -121,9 +166,17 @@ func NewObjectFromJSON(bytes []byte) (Object, error) {
 }
 
 func NewObject(parent Object) Object {
+	if parent == nil {
+		return newObject(nil)
+	} else {
+		return newObject(parent.Private())
+	}
+}
+
+func newObject(p *object) *object {
 	now := time.Now().UnixNano()
 
-	if parent == nil {
+	if p == nil {
 		o := &object{
 			cTime:   now,
 			mTime:   now,
@@ -132,24 +185,74 @@ func NewObject(parent Object) Object {
 		return o
 	}
 
-	p := parent.Private()
 	o := &object{
-		mimetype: p.mimetype,
-		blobRef:  p.blobRef,
-		cTime:    p.cTime,
-		mTime:    now,
-		tags:     p.tags,  // TODO: copy
-		attrs:    p.attrs, // TODO: copy
-		parent:   p,
-		mutable:  true,
+		objType:   p.objType,
+		blobRef:   p.blobRef,
+		uniqRef:   p.uniqRef,
+		parentRef: p.selfRef,
+		cTime:     p.cTime,
+		mTime:     now,
+		tags:      slices.Clone(p.tags),
+		attrs:     maps.Clone(p.attrs),
+		entries:   maps.Clone(p.entries),
+		parent:    p,
+		mutable:   true,
 	}
 	return o
 }
 
+func x(val string, alt string) string {
+	if val == "" {
+		return alt
+	} else {
+		return val
+	}
+}
+
+func (o *object) String() string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "{ type: %q", x(o.objType, "none"))
+	if o.selfRef != "" {
+		fmt.Fprintf(&b, ", self: @%.8s", o.selfRef)
+	}
+	if o.uniqRef != "" {
+		fmt.Fprintf(&b, ", uniq: @%.8s", o.uniqRef)
+	}
+	if o.blobRef != "" {
+		fmt.Fprintf(&b, ", blob: @%.8s", o.blobRef)
+	}
+	if o.parentRef != "" {
+		fmt.Fprintf(&b, ", prev: @%.8s", o.parentRef)
+	}
+	if len(o.attrs) > 0 {
+		b.WriteString(", attrs: { ")
+		for k, v := range o.attrs {
+			fmt.Fprintf(&b, "%s: %q, ", k, v)
+		}
+		b.WriteString("}")
+	}
+	if len(o.entries) > 0 {
+		b.WriteString(", entries: { ")
+		for k, v := range o.entries {
+			fmt.Fprintf(&b, "%s: @%.8s, ", k, v)
+		}
+		b.WriteString("}")
+	}
+	if len(o.tags) > 0 {
+		b.WriteString(", tags: [ ")
+		for _, v := range o.tags {
+			fmt.Fprintf(&b, "%q, ", v)
+		}
+		b.WriteString("]")
+	}
+	b.WriteString(", }")
+	return b.String()
+}
+
 type object struct {
-	mimetype  string
+	objType   string
 	selfRef   string
-	blobRef   string
 	uniqRef   string
 	parentRef string
 	cTime     int64
@@ -160,7 +263,8 @@ type object struct {
 
 	refCount int32
 	parent   *object
-	mutable  bool // may this object be modified?
+	mutable  bool   // may this object be modified?
+	blobRef  string // set when immutable and written to BlobStore
 }
 
 // for JSON deserializing
@@ -172,6 +276,7 @@ type anyobject struct {
 	CTime     string
 	MTime     string
 	Tags      []string
+	Entries   map[string]string
 	Attrs     map[string]string
 	InfoHash  string
 }
@@ -225,13 +330,14 @@ func unpackObject(b []byte) (o *object, err error) {
 	mtime, _ := strconv.ParseInt(t.MTime, 10, 64)
 
 	o = &object{
-		mimetype:  t.Type,
+		objType:   t.Type,
 		blobRef:   t.BlobRef,
 		parentRef: t.ParentRef,
 		cTime:     ctime,
 		mTime:     mtime,
 		tags:      t.Tags,
 		attrs:     t.Attrs,
+		entries:   t.Entries,
 		selfRef:   hex.EncodeToString(sum),
 		mutable:   false,
 	}
@@ -241,16 +347,22 @@ func unpackObject(b []byte) (o *object, err error) {
 func (o *object) pack() []byte {
 	// string maps get marshalled into json in key sort order
 	payload := make(map[string]interface{})
-	payload["type"] = o.mimetype
+	payload["type"] = o.objType
 
 	// uniq objects are special and never have non-attr fields
-	if o.mimetype != "infodump/uniq" {
+	if o.objType != "uniq" {
 		payload["blobref"] = o.blobRef
 		payload["parentref"] = o.parentRef
 		payload["ctime"] = strconv.FormatInt(o.cTime, 10)
 		payload["mtime"] = strconv.FormatInt(o.mTime, 10)
+		if o.uniqRef != "" {
+			payload["uniqref"] = o.uniqRef
+		}
 		if o.tags != nil {
 			payload["tags"] = o.tags
+		}
+		if o.entries != nil {
+			payload["entries"] = o.tags
 		}
 	}
 	if o.attrs != nil {
@@ -330,6 +442,9 @@ func (os *ObjectStore) Get(ref string) Object {
 	return o
 }
 
+// Serialize an object and write it into the underlying blobstore.
+// The object will become immutable as a side effect.
+// TODO: sort tags[] to reflect the sort order that will exist on a fresh Get()
 func (os *ObjectStore) Put(obj Object) error {
 	if obj == nil {
 		return ErrBadObject
@@ -344,7 +459,7 @@ func (os *ObjectStore) newUniq(root bool) (o Object, err error) {
 	}
 
 	o = NewObject(nil)
-	o.SetType("infodump/uniq")
+	o.SetType("uniq")
 	o.SetAttr("random", hex.EncodeToString(rval))
 	if root {
 		o.SetAttr("root", "true")
@@ -386,4 +501,86 @@ func (os *ObjectStore) put(obj *object) error {
 	os.lock.Unlock()
 
 	return nil
+}
+
+func (os *ObjectStore) putChild(dir *object, child *object, name string) (Object, error) {
+	if dir.mutable {
+		return nil, ErrBadState
+	}
+	if dir.objType != "dir" {
+		return nil, ErrBadState
+	}
+	if child.uniqRef == "" {
+		return nil, ErrBadState
+	}
+	if !IsValidName(name) {
+		return nil, ErrBadName
+	}
+	if dir.entries[name] != "" {
+		return nil, ErrExists
+	}
+
+	if child.mutable {
+		if err := os.put(child); err != nil {
+			return nil, err
+		}
+	}
+
+	// TODO: validate child's selfref?
+	// TODO: validate child's uniqref
+
+	dir = newObject(dir)
+	var dirobj Object = dir
+	dirobj.SetEntry(name, child.uniqRef)
+	if err := os.Put(dir); err != nil {
+		return nil, err
+	} else {
+		return dir, nil
+	}
+}
+
+// Attach an object (child) to a directory object under the provided name.
+// If child is mutable, will attempt to Put() it first
+// ErrBadObject: dir or child is nil
+// ErrBadState: dir is mutable, dir is not a directory, child has no uniqref
+// ErrBadName: invalid name
+func (os *ObjectStore) PutChild(dir Object, child Object, name string) (Object, error) {
+	if (dir == nil) || (child == nil) {
+		return nil, ErrBadObject
+	} else {
+		return os.putChild(dir.Private(), child.Private(), name)
+	}
+}
+
+func (os *ObjectStore) CreateDirectory() (Object, error) {
+	uniq, err := os.NewUniq()
+	if err != nil {
+		return nil, err
+	}
+	dir := NewObject(nil)
+	dir.SetType("dir")
+	dir.SetUniq(uniq.SelfRef())
+	if err = os.Put(dir); err != nil {
+		return nil, err
+	} else {
+		return dir, nil
+	}
+}
+
+// Create a new Uniq Object, then point this (mutable) Object at it
+// and commit it to the ObjectStore.
+func (os *ObjectStore) PutUniq(obj Object) error {
+	if obj == nil {
+		return ErrBadObject
+	}
+	o := obj.Private()
+	if !o.mutable {
+		return ErrBadState
+	}
+	uniq, err := os.NewUniq()
+	if err != nil {
+		return err
+	}
+	o.uniqRef = uniq.SelfRef()
+	return os.put(o)
 }

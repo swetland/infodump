@@ -16,4 +16,5 @@ const ErrBadName = Error("invalid name")
 const ErrNotFound = Error("does not exist")
 const ErrExists = Error("already exists")
 const ErrBadObject = Error("invalid object")
+const ErrBadState = Error("invalid state")
 
